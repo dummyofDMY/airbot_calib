@@ -2,6 +2,10 @@ import argparse
 import sys
 import os
 import datetime
+import json
+import re
+from pathlib import Path
+from types import SimpleNamespace
 import numpy as np
 import cv2
 
@@ -10,15 +14,7 @@ import time
 import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as R
 
-try:
-    from airbot_camera import RealsenseCamera, USBCamera
-    from airbot_py.arm import AIRBOTPlay, RobotMode
-except ImportError as e:
-    print(f"ImportError: Failed to import airbot_py.arm: {e}")
-    sys.exit(1)
-except Exception as e:
-    print(f"An unexpected error occurred during import: {e}")
-    sys.exit(1)
+DETECT_FLAG = cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
 
 parser = argparse.ArgumentParser(description="Airbot Calibration Tool")
 parser.add_argument(
@@ -39,11 +35,24 @@ parser.add_argument(
 parser.add_argument(
     "--no-display-mode", action="store_true", help="Calibrate in no display mode."
 )
+parser.add_argument(
+    "--input-dir", type=str, help="Load image<N>.png and robot_poses.json from an existing capture directory; skip hardware capture."
+)
 
 args = parser.parse_args()
 space_len = 6
+if args.no_display_mode:
+    plt.switch_backend("Agg")
 
-if args.camera_type == "ros":
+if not args.input_dir:
+    try:
+        from airbot_camera import RealsenseCamera, USBCamera
+        from airbot_py.arm import AIRBOTPlay, RobotMode
+    except ImportError as e:
+        print(f"Failed to import capture hardware dependencies: {e}")
+        sys.exit(1)
+
+if args.camera_type == "ros" and not args.input_dir:
     import rclpy
     from rclpy.node import Node
     from sensor_msgs.msg import Image
@@ -136,22 +145,32 @@ class ChessBoard:
         self.rows = 10
         self.cols = 8
         self.square_size = 0.02 # m
-        self.number_of_image_needed = 15
+        self.number_of_image_needed = 30
 
 
 class AirbotCalibration:
     def __init__(self):
         self.type = args.type
+        if self.type == "hand_eye" and not hasattr(cv2, "calibrateHandEye"):
+            raise RuntimeError(
+                f"OpenCV {cv2.__version__} does not provide cv2.calibrateHandEye. "
+                'Install a compatible version: python -m pip install "opencv-python>=4.5,<5"'
+            )
         self.camera = None
         self.cam_intrinsic = None
         self.cam_distortion = None
         self.cam2end = None
         self.project_error = None
+        self.hand_eye_errors = None
         
         self.images = []
         self.end_pose_matrixes = []
+        self._reviewed_corners = {}
+        self.image_indices = None
         
-        if args.camera_type == "realsense":
+        if args.input_dir:
+            self.load_data(args.input_dir)
+        elif args.camera_type == "realsense":
             try:
                 self.camera = RealsenseCamera()
             except ImportError as e:
@@ -166,9 +185,64 @@ class AirbotCalibration:
             raise ValueError(f"Unsupported camera type: {args.camera_type}")
         
         self.chessboard = ChessBoard()
-        self.time_str = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        time_format = "%Y%m%d%H%M%S_offline_%f" if args.input_dir else "%Y%m%d%H%M%S"
+        self.time_str = datetime.datetime.now().strftime(time_format)
         self.save_path = os.path.join(args.output_path, f"{self.type}_{self.camera.WIDTH}x{self.camera.HEIGHT}", self.time_str)
         os.makedirs(self.save_path, exist_ok=True)
+
+    def load_data(self, input_dir):
+        """Load saved images and end-to-base matrices, pairing by filename."""
+        directory = Path(input_dir).expanduser().resolve()
+        if not directory.is_dir():
+            raise ValueError(f"Calibration input directory does not exist: {directory}")
+        files = sorted(
+            [p for p in directory.iterdir() if p.is_file() and re.fullmatch(r"image\d+\.png", p.name)],
+            key=lambda p: int(p.stem[5:]))
+        if not files:
+            raise ValueError(f"No image<N>.png files found in {directory}")
+        poses = {}
+        if self.type == "hand_eye":
+            pose_path = directory / "robot_poses.json"
+            if not pose_path.is_file():
+                raise ValueError(f"Hand-eye calibration requires {pose_path}; images alone only support --type intrinsic")
+            with pose_path.open(encoding="utf-8") as file:
+                saved = json.load(file)
+            if (not isinstance(saved, dict) or saved.get("transform") != "end_to_base"
+                    or saved.get("translation_unit") != "m" or not isinstance(saved.get("poses"), dict)):
+                raise ValueError("robot_poses.json must contain transform=end_to_base, translation_unit=m and a poses dictionary")
+            poses = saved["poses"]
+        images, matrices, indices = [], [], []
+        shape = None
+        for path in files:
+            image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError(f"Cannot read calibration image: {path}")
+            if shape is not None and image.shape[:2] != shape:
+                raise ValueError(f"Calibration images must have the same resolution: {path.name}")
+            shape = image.shape[:2]
+            if self.type == "hand_eye":
+                if path.name not in poses:
+                    raise ValueError(f"Missing robot pose for {path.name} in robot_poses.json")
+                matrix = np.asarray(poses[path.name], dtype=np.float64)
+                try:
+                    self._validate_hand_eye_pose(matrix)
+                except ValueError as error:
+                    raise ValueError(f"Invalid robot pose for {path.name}: {error}") from error
+                matrices.append(matrix)
+            images.append(image)
+            indices.append(int(path.stem[5:]))
+        if self.type == "hand_eye" and len(images) < 3:
+            raise ValueError("Hand-eye calibration requires at least 3 saved image/pose pairs")
+        self.images = images
+        self.end_pose_matrixes = matrices
+        self.image_indices = indices
+        self._reviewed_corners.clear()
+        # Resolution metadata only: no camera is opened in offline mode.
+        self.camera = SimpleNamespace(WIDTH=shape[1], HEIGHT=shape[0])
+        print(f"Loaded {len(images)} images from {directory}")
+
+    def original_image_index(self, index):
+        return self.image_indices[index] if self.image_indices is not None else index
         
     def choose_image(self, name="Image"):
         if args.no_display_mode:
@@ -185,6 +259,7 @@ class AirbotCalibration:
                     return image
         
     def data_collect(self):
+        self._reviewed_corners.clear()
         with AIRBOTPlay(port=args.port) as robot:
             robot.switch_mode(RobotMode.GRAVITY_COMP)
             print("Robot switched to GRAVITY_COMP mode.")
@@ -197,7 +272,8 @@ class AirbotCalibration:
             image = self.choose_image(f"Collect data {i+1}/{self.chessboard.number_of_image_needed}")
             self.images.append(image)
             image_name = os.path.join(self.save_path, f"image{i}.png")
-            cv2.imwrite(image_name, image)
+            if not cv2.imwrite(image_name, image):
+                raise OSError(f"Failed to save calibration image: {image_name}")
             if self.type == "hand_eye":
                 pose_matrix = None
                 with AIRBOTPlay(port=args.port) as robot:
@@ -206,13 +282,37 @@ class AirbotCalibration:
                     pose_matrix[:3, :3] = R.from_quat(pose[1]).as_matrix()
                     pose_matrix[:3, 3] = pose[0]
                 self.end_pose_matrixes.append(pose_matrix)
+                pose_file = self.save_robot_poses()
                 print(f"--Data{i} Saved--\n  Image: {image_name}\n  Pose: {pose_matrix.flatten()}")
+                print(f"  Pose file: {pose_file}")
             elif self.type == "intrinsic":
                 print(f"--Data{i} Saved--\n  Image: {image_name}")
             else:
                 raise ValueError("Unsupported calibration type")
 
             cv2.destroyAllWindows()
+
+    def save_robot_poses(self):
+        """Persist collected end-to-base poses, keyed by their image filenames."""
+        data = {
+            "transform": "end_to_base",
+            "translation_unit": "m",
+            "poses": {
+                f"image{self.original_image_index(i)}.png": matrix.tolist()
+                for i, matrix in enumerate(self.end_pose_matrixes)
+            },
+        }
+        path = os.path.join(self.save_path, "robot_poses.json")
+        # Replace only after the new file is complete, preserving earlier samples
+        # if writing the next update fails or the process is interrupted.
+        temporary_path = path + ".tmp"
+        with open(temporary_path, "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=2, allow_nan=False)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary_path, path)
+        return path
     
     def plot_calibration_result(self, project_errors, image_points, object_points, rvecs, tvecs, mtx, dist):
         plt.figure(figsize=(15,5))
@@ -224,8 +324,13 @@ class AirbotCalibration:
         plt.grid(True)
         # Error histogram
         plt.subplot(132)
-        all_errors = np.sqrt(np.sum((np.array(image_points)-np.array([cv2.projectPoints(o, r, t, mtx, dist)[0] 
-                                for o,r,t in zip(object_points, rvecs, tvecs)]))**2, axis=2))
+        all_errors = np.concatenate([
+            np.linalg.norm(
+                np.asarray(observed, dtype=np.float64).reshape(-1, 2)
+                - np.asarray(cv2.projectPoints(o, r, t, mtx, dist)[0],
+                             dtype=np.float64).reshape(-1, 2), axis=1)
+            for observed, o, r, t in zip(image_points, object_points, rvecs, tvecs)
+        ])
         plt.hist(all_errors.ravel(), bins=50, color='g')
         plt.xlabel('Error (pixels)'), plt.ylabel('Count')
         plt.title('Error Histogram')
@@ -242,6 +347,37 @@ class AirbotCalibration:
         plt.savefig(save_dir, dpi=300, bbox_inches='tight')
         print(f"Error analysis plot saved to: {save_dir}\n\n")
         
+    def reviewed_corners(self, image_index):
+        """Detect and review once; reuse the same selection for both calibrations."""
+        if image_index in self._reviewed_corners:
+            return self._reviewed_corners[image_index]
+        image = self.images[image_index]
+        original_index = self.original_image_index(image_index)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        found, corners = cv2.findChessboardCornersSB(
+            gray, (self.chessboard.cols, self.chessboard.rows), flags=DETECT_FLAG)
+        if not found:
+            print(f"Image {original_index}: chessboard pattern not found; skipping")
+            corners = None
+        elif not args.no_display_mode:
+            preview = image.copy()
+            cv2.drawChessboardCorners(
+                preview, (self.chessboard.cols, self.chessboard.rows),
+                np.asarray(corners, dtype=np.float32).reshape(-1, 1, 2), True)
+            cv2.putText(preview, f"Image {original_index}: D = discard, other key = keep",
+                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            window = "Review chessboard corners"
+            cv2.imshow(window, preview)
+            try:
+                key = cv2.waitKey(0) & 0xFF
+            finally:
+                cv2.destroyWindow(window)
+            if key in (ord("d"), ord("D")):
+                print(f"Image {original_index}: discarded by user (including robot pose)")
+                corners = None
+        self._reviewed_corners[image_index] = corners
+        return corners
+
     def calibrate_camera(self):
         print("\nStarting camera calibration...")
         # 3D object points of the chessboard
@@ -251,25 +387,14 @@ class AirbotCalibration:
         
         object_points = []
         image_points = []
-        for image in self.images:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            ret, corners = cv2.findChessboardCorners(gray, (self.chessboard.cols, self.chessboard.rows), None)
-            if ret:
-                # optimize the corner positions
-                criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-                corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-                
+        for i in range(len(self.images)):
+            corners = self.reviewed_corners(i)
+            if corners is not None:
                 object_points.append(object_point)
-                image_points.append(corners2)
-                
-                img_show = image.copy()
-                cv2.drawChessboardCorners(img_show, (self.chessboard.cols, self.chessboard.rows), corners2, ret)
-                cv2.imshow('Corners', img_show)
-                cv2.waitKey(50)
-            else:
-                print("Chessboard pattern not found in image")
-        
-        cv2.destroyAllWindows()
+                image_points.append(corners)
+
+        if not image_points:
+            raise ValueError("No accepted chessboard frames remain for camera calibration")
         
         ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(object_points, image_points, (self.camera.WIDTH, self.camera.HEIGHT), None, None)
         
@@ -279,7 +404,11 @@ class AirbotCalibration:
         project_errors = []
         for i in range(len(object_points)):
             imgpoints2, _ = cv2.projectPoints(object_points[i], rvecs[i], tvecs[i], mtx, dist)
-            error = cv2.norm(image_points[i], imgpoints2, cv2.NORM_L2)/len(imgpoints2)
+            # OpenCV versions can return corners as (N, 2) or (N, 1, 2).
+            # Normalize both layout and dtype before comparing corresponding points.
+            observed = np.asarray(image_points[i], dtype=np.float64).reshape(-1, 2)
+            projected = np.asarray(imgpoints2, dtype=np.float64).reshape(-1, 2)
+            error = cv2.norm(observed, projected, cv2.NORM_L2) / len(projected)
             project_errors.append(error)
         self.project_error = np.mean(np.array(project_errors))
         
@@ -287,6 +416,9 @@ class AirbotCalibration:
         
         
     def calibrate_hand_eye(self, intrinsic, distortion):
+        self.hand_eye_errors = None
+        if len(self.images) != len(self.end_pose_matrixes):
+            raise ValueError("Hand-eye images and robot poses must have matching lengths")
         # 3D object points of the chessboard
         object_point = np.zeros((self.chessboard.rows * self.chessboard.cols, 3), np.float32)
         object_point[:, :2] = np.mgrid[0:self.chessboard.cols, 0:self.chessboard.rows].T.reshape(-1, 2)
@@ -296,24 +428,43 @@ class AirbotCalibration:
         T_checkerboard_to_camera_poses = []
         R_end_to_base_poses = []
         T_end_to_base_poses = []
+        valid_samples = []
         
         for i in range(len(self.images)):
-            gray = cv2.cvtColor(self.images[i], cv2.COLOR_BGR2GRAY)
-            ret, corners = cv2.findChessboardCorners(gray, (self.chessboard.cols, self.chessboard.rows), None)
-            if not ret:
-                print("Chessboard pattern not found in image")
+            original_index = self.original_image_index(i)
+            corners = self.reviewed_corners(i)
+            if corners is None:
                 continue
             else:
-                criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-                corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-                ret, rvec, tvec = cv2.solvePnP(object_point, corners2, intrinsic, distortion)
+                try:
+                    ret, rvec, tvec = cv2.solvePnP(object_point, corners, intrinsic, distortion)
+                except cv2.error as error:
+                    print(f"PnP failed in image {original_index}; skipping image and robot pose: {error}")
+                    continue
+                if not ret:
+                    print(f"PnP failed in image {original_index}; skipping image and robot pose")
+                    continue
                 R_cam_pose, _ = cv2.Rodrigues(rvec)
+                board_to_camera = np.eye(4)
+                board_to_camera[:3, :3] = R_cam_pose
+                board_to_camera[:3, 3] = tvec.flatten()
+                self._validate_hand_eye_pose(board_to_camera)
+                self._validate_hand_eye_pose(self.end_pose_matrixes[i])
+                valid_samples.append({
+                    "image_index": original_index,
+                    "image_points": corners.copy(),
+                    "board_to_camera": board_to_camera,
+                    "end_to_base": self.end_pose_matrixes[i].copy(),
+                })
                 R_checkerboard_to_camera_poses.append(R_cam_pose)
                 T_checkerboard_to_camera_poses.append(tvec.flatten())
                 
                 R_end_to_base_poses.append(self.end_pose_matrixes[i][:3, :3])
                 T_end_to_base_poses.append(self.end_pose_matrixes[i][:3, 3])
             
+        if len(valid_samples) < 3:
+            raise ValueError("Hand-eye calibration requires at least 3 valid image/pose pairs")
+
         R_cam2end, T_cam2end = cv2.calibrateHandEye(
             R_end_to_base_poses, T_end_to_base_poses, 
             R_checkerboard_to_camera_poses, T_checkerboard_to_camera_poses,
@@ -323,29 +474,136 @@ class AirbotCalibration:
         self.cam2end = np.eye(4)
         self.cam2end[:3, :3] = R_cam2end
         self.cam2end[:3, 3] = T_cam2end.flatten()
+        self.evaluate_hand_eye(valid_samples, object_point, intrinsic, distortion)
+        if self.hand_eye_errors["status"] == "ok":
+            self.plot_hand_eye_result()
         
         return self.cam2end
-    
-    # def verify_hand_eye(self):
-    #     image = self.choose_image("Verify Hand Eye Calibration")
-    #     # 3D object points of the chessboard
-    #     object_point = np.zeros((self.chessboard.rows * self.chessboard.cols, 3), np.float32)
-    #     object_point[:, :2] = np.mgrid[0:self.chessboard.cols, 0:self.chessboard.rows].T.reshape(-1, 2)
-    #     object_point *= self.chessboard.square_size
-        calibrate_camera
-    #     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    #     ret, corners = cv2.findChessboardCorners(gray, (self.chessboard.cols, self.chessboard.rows), None)
-    #     if ret:
-    #         # optimize the corner positions
-    #         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-    #         corners2 = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-        
-    #     end_to_base_pose = None
-        
-    #     with AIRBOTPlay(port=args.port) as robot:
-    #         end_to_base_pose = robot.get_end_pose()
-        
-    #     cam_to_base_pose = end_to_base_pose @ self.cam2end
+
+    @staticmethod
+    def _validate_hand_eye_pose(pose):
+        pose = np.asarray(pose)
+        if pose.shape != (4, 4) or not np.isfinite(pose).all():
+            raise ValueError("Hand-eye transform must be a finite 4x4 matrix")
+        rotation = pose[:3, :3]
+        if (not np.allclose(pose[3], [0, 0, 0, 1], atol=1e-6)
+                or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-6)
+                or not np.isclose(np.linalg.det(rotation), 1, atol=1e-6)):
+            raise ValueError("Hand-eye transform must be a rigid transform")
+
+    def evaluate_hand_eye(self, samples, object_points, intrinsic, distortion):
+        """Evaluate training-data consistency for eye-in-hand with a static board.
+
+        Samples contain image_index, image_points, board_to_camera and end_to_base.
+        Translations are in metres. The result is not absolute extrinsic accuracy:
+        it also includes intrinsic, corner detection and robot pose errors.
+        The reference board pose averages end_to_base @ cam2end @ board_to_camera.
+        Reprojection uses inv(end_to_base @ cam2end) @ reference, so the predicted
+        image points depend on the hand-eye solution instead of only per-frame PnP.
+        """
+        self.hand_eye_errors = {"status": "failed", "valid_frames": len(samples)}
+        try:
+            if len(samples) < 3:
+                raise ValueError("Evaluation requires at least 3 valid image/pose pairs")
+            self._validate_hand_eye_pose(self.cam2end)
+            points = np.asarray(object_points, dtype=np.float64).reshape(-1, 3)
+            if not len(points) or not np.isfinite(points).all():
+                raise ValueError("Invalid chessboard object points")
+            board_poses = []
+            for sample in samples:
+                self._validate_hand_eye_pose(sample["end_to_base"])
+                self._validate_hand_eye_pose(sample["board_to_camera"])
+                board_poses.append(sample["end_to_base"] @ self.cam2end
+                                   @ sample["board_to_camera"])
+            board_poses = np.asarray(board_poses)
+            if not np.isfinite(board_poses).all():
+                raise ValueError("Non-finite board-to-base transform")
+            reference = np.eye(4)
+            reference[:3, :3] = R.from_matrix(board_poses[:, :3, :3]).mean().as_matrix()
+            reference[:3, 3] = board_poses[:, :3, 3].mean(axis=0)
+            per_frame = []
+            squared_errors = []
+            for sample, board_pose in zip(samples, board_poses):
+                predicted = np.linalg.inv(sample["end_to_base"] @ self.cam2end) @ reference
+                camera_points = points @ predicted[:3, :3].T + predicted[:3, 3]
+                if not np.isfinite(camera_points).all() or np.any(camera_points[:, 2] <= 0):
+                    raise ValueError(f"Image {sample['image_index']}: invalid predicted corner depth")
+                rvec, _ = cv2.Rodrigues(predicted[:3, :3])
+                projected, _ = cv2.projectPoints(points, rvec, predicted[:3, 3], intrinsic, distortion)
+                observed = np.asarray(sample["image_points"]).reshape(-1, 2)
+                projected = projected.reshape(-1, 2)
+                if (observed.shape != projected.shape or not np.isfinite(observed).all()
+                        or not np.isfinite(projected).all()):
+                    raise ValueError(f"Image {sample['image_index']}: invalid image points")
+                # RMSE is sqrt(mean(dx**2 + dy**2)), not L2 norm divided by N.
+                squared = np.sum((observed - projected) ** 2, axis=1)
+                squared_errors.append(squared)
+                per_frame.append({
+                    "image_index": sample["image_index"],
+                    "reprojection_rmse_px": float(np.sqrt(squared.mean())),
+                    "translation_error_mm": float(1000 * np.linalg.norm(board_pose[:3, 3] - reference[:3, 3])),
+                    "rotation_error_deg": float(np.degrees(R.from_matrix(
+                        reference[:3, :3].T @ board_pose[:3, :3]).magnitude())),
+                })
+            translations = np.array([row["translation_error_mm"] for row in per_frame])
+            rotations = np.array([row["rotation_error_deg"] for row in per_frame])
+            summary = {
+                "reprojection_rmse_px": float(np.sqrt(np.concatenate(squared_errors).mean())),
+                "translation_rms_mm": float(np.sqrt(np.mean(translations ** 2))),
+                "translation_max_mm": float(translations.max()),
+                "rotation_rms_deg": float(np.sqrt(np.mean(rotations ** 2))),
+                "rotation_max_deg": float(rotations.max()),
+            }
+            if not np.isfinite(list(summary.values())).all():
+                raise ValueError("Non-finite hand-eye error statistics")
+            self.hand_eye_errors = {
+                "status": "ok", "valid_frames": len(samples),
+                "board_to_base_reference": reference, "summary": summary, "per_frame": per_frame,
+            }
+        except (ValueError, np.linalg.LinAlgError, cv2.error) as error:
+            self.hand_eye_errors["reason"] = str(error)
+            print(f"Hand-eye evaluation failed: {error}")
+        return self.hand_eye_errors
+
+    def plot_hand_eye_result(self):
+        rows = self.hand_eye_errors["per_frame"]
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        for ax, key, label in zip(axes,
+                ["reprojection_rmse_px", "translation_error_mm", "rotation_error_deg"],
+                ["Reprojection RMSE (pixels)", "Translation error (mm)", "Rotation error (degrees)"]):
+            ax.plot([row["image_index"] for row in rows], [row[key] for row in rows], "o-")
+            ax.set_xlabel("Original image index (zero-based)")
+            ax.set_ylabel(label)
+            ax.grid(True)
+        fig.suptitle("Hand-eye training-data consistency")
+        fig.tight_layout()
+        path = os.path.join(self.save_path, "hand_eye_error_analysis.jpg")
+        fig.savefig(path, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Hand-eye error analysis plot saved to: {path}")
+
+    def format_hand_eye_report(self):
+        result = self.hand_eye_errors
+        if result is None:
+            return ""
+        lines = ["\n--Hand-eye Evaluation--",
+                 "Training-data consistency (标定数据一致性误差); not independent absolute accuracy.",
+                 f"Valid frames: {result['valid_frames']}"]
+        if result["status"] != "ok":
+            lines.append(f"Evaluation FAILED: {result['reason']}")
+        else:
+            labels = {"reprojection_rmse_px": "Reprojection RMSE (pixels)",
+                      "translation_rms_mm": "Translation RMS (mm)",
+                      "translation_max_mm": "Translation max (mm)",
+                      "rotation_rms_deg": "Rotation RMS (degrees)",
+                      "rotation_max_deg": "Rotation max (degrees)"}
+            for key, label in labels.items():
+                lines.append(f"{label}: {result['summary'][key]:.6f}")
+            lines.append("Image index (zero-based), reprojection RMSE (pixels), translation (mm), rotation (degrees)")
+            for row in result["per_frame"]:
+                lines.append(f"{row['image_index']}, {row['reprojection_rmse_px']:.6f}, "
+                             f"{row['translation_error_mm']:.6f}, {row['rotation_error_deg']:.6f}")
+        return "\n".join(lines) + "\n"
     
     def report_calibration(self):
         reporter_head = f"""---Calibration Report---
@@ -355,6 +613,7 @@ Chessboard: {self.chessboard.rows}x{self.chessboard.cols}-{self.chessboard.squar
 """
         if self.project_error is not None:
             reporter_head += f"Project Error: {self.project_error}\n"
+        reporter_head += self.format_hand_eye_report()
             
         print(reporter_head)
         
@@ -371,7 +630,7 @@ Chessboard: {self.chessboard.rows}x{self.chessboard.cols}-{self.chessboard.squar
             MatrixPrinter.print_matrix(self.cam2end)
         
         file_name = os.path.join(self.save_path, "Calibration_Report.txt")
-        with open(file_name, "w") as f:
+        with open(file_name, "w", encoding="utf-8") as f:
             f.write(reporter_head)
             
         if self.cam_intrinsic is not None:
@@ -502,17 +761,18 @@ if __name__ == "__main__":
         print(f"{'='*60}")
         print(f"Calibration type: {args.type}")
         print(f"Camera type: {args.camera_type}")
-        print(f"Resolution: {calibrator.camera.resolution}")
-        print(f"Output path: {args.output_path}")
+        print(f"Resolution: {calibrator.camera.WIDTH}x{calibrator.camera.HEIGHT}")
+        print(f"Output path: {calibrator.save_path}")
         print(f"Robot port: {args.port}")
-        if args.camera_type == "usbcam":
+        if args.camera_type == "usbcam" and not args.input_dir:
             print(f"USB camera device ID: {calibrator.camera.device_id}")
         print(f"{'='*60}\n")
     
         print("Initialized calibrator successfully.")
         
-        calibrator.data_collect()
-        print("Data collection complete.")
+        if not args.input_dir:
+            calibrator.data_collect()
+            print("Data collection complete.")
         
         calibrator.calibrate_camera()
             
@@ -520,13 +780,18 @@ if __name__ == "__main__":
             calibrator.calibrate_hand_eye(calibrator.cam_intrinsic, calibrator.cam_distortion)
             
         calibrator.report_calibration()
-        print("\nCalibration process completed successfully.")
-        
-        ax = draw_frame(np.eye(4), name='eef')
-        draw_frame(calibrator.cam2end, ax=ax, name='cam')
-        ax.view_init(elev=20, azim=70)
+        if calibrator.hand_eye_errors is not None and calibrator.hand_eye_errors["status"] != "ok":
+            print("\nCalibration parameters computed, but hand-eye evaluation FAILED; see the report.")
+        else:
+            print("\nCalibration process completed successfully.")
 
-        plt.show()
+        if not args.no_display_mode:
+            if calibrator.cam2end is not None:
+                ax = draw_frame(np.eye(4), name='eef')
+                draw_frame(calibrator.cam2end, ax=ax, name='cam')
+                ax.view_init(elev=20, azim=70)
+            plt.show()
                 
     except Exception as e:
         print(f"\nError during calibration: {e}")
+        sys.exit(1)

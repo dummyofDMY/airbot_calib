@@ -1,1 +1,5 @@
 calib/hand_eye_*/
+airbot_logs
+.vscode
+logs
+**/__pycache__

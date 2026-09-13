@@ -1,7 +1,7 @@
 ## Dependencies Installation
 ```bash
 # Install airbot configuration package (skip this step on Pro version)
-sudo apt install ./dep/airbot-configure_5.1.6-1_all.deb
+sudo apt install ./airbot-configure_5.1.6-1_all.deb
 
 # Set up Python virtual environment
 sudo apt install python3-venv
@@ -13,7 +13,7 @@ mkdir -p ~/.pip && echo -e "[global]\nindex-url = https://pypi.tuna.tsinghua.edu
 
 # Arm environment installation reference:https://docs.airbots.online/airbot-play/quick-start/software-setup.html
 # Install required packages 
-pip install ./dep/airbot_py-5.1.6-py3-none-any.whl
+pip install ./airbot_py-5.1.6-py3-none-any.whl
 # Proxy might be required in command line or you can manually download and install the source code
 pip install -r requirements.txt -i https://mirrors.huaweicloud.com/repository/pypi/simple
 ```
@@ -32,6 +32,23 @@ The calibration board is a 9×11, 20mm black and white chessboard pattern calibr
 python3 airbot_calibration.py  # Use -h flag for help options
 ```
 Drag arm to change robot pose, make sure that the chessboard in the camera view, Press `ESC` to capture img and pose.
+
+To recalibrate from saved data without connecting the camera or robot:
+
+```bash
+python3 airbot_calibration.py --input-dir calib/hand_eye_640x480/20260912183126
+```
+
+The directory must contain `image<N>.png` and, for hand-eye calibration, the
+`robot_poses.json` saved during capture (`end_to_base` matrices in metres, keyed
+by image filename). Images are sorted numerically and paired by filename; extra
+pose entries for removed images are ignored. Use the same chessboard dimensions
+and square size configured in `ChessBoard` as during capture.
+Press `D` in the corner preview to discard a frame, or another key to keep it.
+Add `--no-display-mode` to skip manual review and run without windows.
+Use `--type intrinsic` to compute only intrinsics from images without robot poses.
+Reports and plots are saved in a new timestamped directory under `--output-path`
+(default: `calib/`); the input data is not overwritten.
 
 Calibration Suggestions:Capture images from as many different orientations and positions as possible during calibration. Be careful not to move the arm to its limit positions.
 
