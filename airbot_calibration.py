@@ -452,7 +452,6 @@ class AirbotCalibration:
                 self._validate_hand_eye_pose(self.end_pose_matrixes[i])
                 valid_samples.append({
                     "image_index": original_index,
-                    "image_points": corners.copy(),
                     "board_to_camera": board_to_camera,
                     "end_to_base": self.end_pose_matrixes[i].copy(),
                 })
@@ -474,7 +473,7 @@ class AirbotCalibration:
         self.cam2end = np.eye(4)
         self.cam2end[:3, :3] = R_cam2end
         self.cam2end[:3, 3] = T_cam2end.flatten()
-        self.evaluate_hand_eye(valid_samples, object_point, intrinsic, distortion)
+        self.evaluate_hand_eye(valid_samples)
         if self.hand_eye_errors["status"] == "ok":
             self.plot_hand_eye_result()
         
@@ -491,24 +490,20 @@ class AirbotCalibration:
                 or not np.isclose(np.linalg.det(rotation), 1, atol=1e-6)):
             raise ValueError("Hand-eye transform must be a rigid transform")
 
-    def evaluate_hand_eye(self, samples, object_points, intrinsic, distortion):
-        """Evaluate training-data consistency for eye-in-hand with a static board.
+    def evaluate_hand_eye(self, samples):
+        """Measure board-to-base pose consistency for a fixed board (eye-in-hand).
 
-        Samples contain image_index, image_points, board_to_camera and end_to_base.
-        Translations are in metres. The result is not absolute extrinsic accuracy:
-        it also includes intrinsic, corner detection and robot pose errors.
-        The reference board pose averages end_to_base @ cam2end @ board_to_camera.
-        Reprojection uses inv(end_to_base @ cam2end) @ reference, so the predicted
-        image points depend on the hand-eye solution instead of only per-frame PnP.
+        Each transform maps source coordinates into destination coordinates:
+        board_to_base = end_to_base @ cam2end @ board_to_camera.
+        Compare translations with their arithmetic mean and rotations with their
+        SO(3) mean, using Euclidean distance (mm) and relative rotation angle (deg).
+        Lower deviations mean better consistency, not absolute accuracy.
         """
         self.hand_eye_errors = {"status": "failed", "valid_frames": len(samples)}
         try:
             if len(samples) < 3:
                 raise ValueError("Evaluation requires at least 3 valid image/pose pairs")
             self._validate_hand_eye_pose(self.cam2end)
-            points = np.asarray(object_points, dtype=np.float64).reshape(-1, 3)
-            if not len(points) or not np.isfinite(points).all():
-                raise ValueError("Invalid chessboard object points")
             board_poses = []
             for sample in samples:
                 self._validate_hand_eye_pose(sample["end_to_base"])
@@ -522,25 +517,10 @@ class AirbotCalibration:
             reference[:3, :3] = R.from_matrix(board_poses[:, :3, :3]).mean().as_matrix()
             reference[:3, 3] = board_poses[:, :3, 3].mean(axis=0)
             per_frame = []
-            squared_errors = []
             for sample, board_pose in zip(samples, board_poses):
-                predicted = np.linalg.inv(sample["end_to_base"] @ self.cam2end) @ reference
-                camera_points = points @ predicted[:3, :3].T + predicted[:3, 3]
-                if not np.isfinite(camera_points).all() or np.any(camera_points[:, 2] <= 0):
-                    raise ValueError(f"Image {sample['image_index']}: invalid predicted corner depth")
-                rvec, _ = cv2.Rodrigues(predicted[:3, :3])
-                projected, _ = cv2.projectPoints(points, rvec, predicted[:3, 3], intrinsic, distortion)
-                observed = np.asarray(sample["image_points"]).reshape(-1, 2)
-                projected = projected.reshape(-1, 2)
-                if (observed.shape != projected.shape or not np.isfinite(observed).all()
-                        or not np.isfinite(projected).all()):
-                    raise ValueError(f"Image {sample['image_index']}: invalid image points")
-                # RMSE is sqrt(mean(dx**2 + dy**2)), not L2 norm divided by N.
-                squared = np.sum((observed - projected) ** 2, axis=1)
-                squared_errors.append(squared)
                 per_frame.append({
                     "image_index": sample["image_index"],
-                    "reprojection_rmse_px": float(np.sqrt(squared.mean())),
+                    "board_to_base": board_pose,
                     "translation_error_mm": float(1000 * np.linalg.norm(board_pose[:3, 3] - reference[:3, 3])),
                     "rotation_error_deg": float(np.degrees(R.from_matrix(
                         reference[:3, :3].T @ board_pose[:3, :3]).magnitude())),
@@ -548,7 +528,6 @@ class AirbotCalibration:
             translations = np.array([row["translation_error_mm"] for row in per_frame])
             rotations = np.array([row["rotation_error_deg"] for row in per_frame])
             summary = {
-                "reprojection_rmse_px": float(np.sqrt(np.concatenate(squared_errors).mean())),
                 "translation_rms_mm": float(np.sqrt(np.mean(translations ** 2))),
                 "translation_max_mm": float(translations.max()),
                 "rotation_rms_deg": float(np.sqrt(np.mean(rotations ** 2))),
@@ -567,15 +546,15 @@ class AirbotCalibration:
 
     def plot_hand_eye_result(self):
         rows = self.hand_eye_errors["per_frame"]
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
         for ax, key, label in zip(axes,
-                ["reprojection_rmse_px", "translation_error_mm", "rotation_error_deg"],
-                ["Reprojection RMSE (pixels)", "Translation error (mm)", "Rotation error (degrees)"]):
+                ["translation_error_mm", "rotation_error_deg"],
+                ["Translation deviation (mm)", "Rotation deviation (degrees)"]):
             ax.plot([row["image_index"] for row in rows], [row[key] for row in rows], "o-")
             ax.set_xlabel("Original image index (zero-based)")
             ax.set_ylabel(label)
             ax.grid(True)
-        fig.suptitle("Hand-eye training-data consistency")
+        fig.suptitle("Board-to-base pose consistency")
         fig.tight_layout()
         path = os.path.join(self.save_path, "hand_eye_error_analysis.jpg")
         fig.savefig(path, dpi=300, bbox_inches="tight")
@@ -587,21 +566,24 @@ class AirbotCalibration:
         if result is None:
             return ""
         lines = ["\n--Hand-eye Evaluation--",
-                 "Training-data consistency (标定数据一致性误差); not independent absolute accuracy.",
+                 "Board-to-base pose consistency (标定数据一致性误差); fixed board, eye-in-hand.",
+                 "board_to_base = end_to_base @ cam2end @ board_to_camera",
+                 "Deviations from mean pose; smaller is better, not absolute accuracy.",
                  f"Valid frames: {result['valid_frames']}"]
         if result["status"] != "ok":
             lines.append(f"Evaluation FAILED: {result['reason']}")
         else:
-            labels = {"reprojection_rmse_px": "Reprojection RMSE (pixels)",
-                      "translation_rms_mm": "Translation RMS (mm)",
+            labels = {"translation_rms_mm": "Translation RMS (mm)",
                       "translation_max_mm": "Translation max (mm)",
                       "rotation_rms_deg": "Rotation RMS (degrees)",
                       "rotation_max_deg": "Rotation max (degrees)"}
             for key, label in labels.items():
                 lines.append(f"{label}: {result['summary'][key]:.6f}")
-            lines.append("Image index (zero-based), reprojection RMSE (pixels), translation (mm), rotation (degrees)")
+            lines.append("Mean board-to-base transform (translation in m):")
+            lines.append(np.array2string(result["board_to_base_reference"], precision=8))
+            lines.append("Image index (zero-based), translation deviation (mm), rotation deviation (degrees)")
             for row in result["per_frame"]:
-                lines.append(f"{row['image_index']}, {row['reprojection_rmse_px']:.6f}, "
+                lines.append(f"{row['image_index']}, "
                              f"{row['translation_error_mm']:.6f}, {row['rotation_error_deg']:.6f}")
         return "\n".join(lines) + "\n"
     
@@ -642,6 +624,15 @@ Chessboard: {self.chessboard.rows}x{self.chessboard.cols}-{self.chessboard.squar
         if self.cam2end is not None:
             MatrixPrinter.save_matrix(self.cam2end, "Extrinsic", file_name)
             
+        if self.hand_eye_errors is not None:
+            pose_file = os.path.join(self.save_path, "hand_eye_consistency.json")
+            with open(pose_file, "w", encoding="utf-8") as file:
+                json.dump({"transform": "board_to_base", "translation_unit": "m",
+                           **self.hand_eye_errors}, file, indent=2, allow_nan=False,
+                          default=lambda value: value.tolist())
+                file.write("\n")
+            print(f"Hand-eye consistency data saved to: {pose_file}")
+
         print(f"\nCalibration report saved to: {file_name}")
         
         

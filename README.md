@@ -50,6 +50,18 @@ Use `--type intrinsic` to compute only intrinsics from images without robot pose
 Reports and plots are saved in a new timestamped directory under `--output-path`
 (default: `calib/`); the input data is not overwritten.
 
+Hand-eye evaluation assumes an eye-in-hand camera and a board fixed relative to
+the robot base. For each accepted frame it computes
+`board_to_base = end_to_base @ cam2end @ board_to_camera`, where `board_to_camera`
+is the PnP pose and `cam2end` is the calibrated camera extrinsic. Translation is
+compared to the mean position, and rotation to the mean rotation on SO(3).
+The report gives RMS and maximum deviations in mm and degrees; smaller values
+indicate better consistency across calibration frames, not absolute accuracy.
+`hand_eye_error_analysis.jpg` plots the per-frame deviations, and
+`hand_eye_consistency.json` saves every board-to-base matrix and the mean pose
+(matrix translations are in metres). Camera intrinsic reprojection errors remain
+in the separate intrinsic report and plot.
+
 Calibration Suggestions:Capture images from as many different orientations and positions as possible during calibration. Be careful not to move the arm to its limit positions.
 
 ![alt text](assets/image-1.png)

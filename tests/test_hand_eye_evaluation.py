@@ -75,8 +75,7 @@ def scene(module, tmp_path):
 
 def evaluate(scene):
     calibrator, points, samples = scene
-    return calibrator.evaluate_hand_eye(samples, points, calibrator.cam_intrinsic,
-                                        calibrator.cam_distortion)
+    return calibrator.evaluate_hand_eye(samples)
 
 
 def test_exact_solution(scene):
@@ -92,22 +91,26 @@ def test_wrong_extrinsics_increase_errors(scene, component):
     if component == "translation":
         calibrator.cam2end[:3, 3] += [0.01, -0.02, 0.015]
     else:
-        calibrator.cam2end[:3, :3] @= Rotation.from_euler("x", 5, degrees=True).as_matrix()
+        calibrator.cam2end[:3, :3] = (calibrator.cam2end[:3, :3]
+                                    @ Rotation.from_euler("x", 5, degrees=True).as_matrix())
     result = evaluate(scene)
     assert result["status"] == "ok"
-    assert result["summary"]["reprojection_rmse_px"] > 0.1
     assert result["summary"]["translation_rms_mm"] > 0.1
     if component == "rotation":
         assert result["summary"]["rotation_rms_deg"] > 0.1
 
 
-def test_pixel_rmse_is_two_dimensional_and_pooled(scene):
-    for i, sample in enumerate(scene[2]):
-        sample["image_points"] += [3 * (i + 1), 4 * (i + 1)]
+def test_evaluation_uses_only_transforms(scene):
+    for sample in scene[2]:
+        del sample["image_points"]
+    scene[0].cam_intrinsic = scene[0].cam_distortion = None
     result = evaluate(scene)
-    expected = 5 * np.arange(1, 13)
-    np.testing.assert_allclose([row["reprojection_rmse_px"] for row in result["per_frame"]], expected)
-    assert result["summary"]["reprojection_rmse_px"] == pytest.approx(np.sqrt(np.mean(expected ** 2)))
+    assert result["status"] == "ok"
+    assert max(result["summary"].values()) < 1e-8
+    for sample, row in zip(scene[2], result["per_frame"]):
+        expected = sample["end_to_base"] @ scene[0].cam2end @ sample["board_to_camera"]
+        np.testing.assert_allclose(row["board_to_base"], expected, atol=1e-12)
+        np.testing.assert_allclose(row["board_to_base"], result["board_to_base_reference"], atol=1e-12)
 
 
 def test_millimetre_and_degree_units(scene):
@@ -125,20 +128,20 @@ def test_millimetre_and_degree_units(scene):
         assert result["summary"][key] == pytest.approx(1)
 
 
-def test_random_corner_noise(scene):
-    rng = np.random.default_rng(17)
-    noise = []
-    for sample in scene[2]:
-        perturbation = rng.normal(0, 0.5, sample["image_points"].shape)
-        sample["image_points"] += perturbation
-        noise.append(perturbation.reshape(-1, 2))
-    expected = np.sqrt(np.mean(np.sum(np.concatenate(noise) ** 2, axis=1)))
-    result = evaluate(scene)
-    assert result["summary"]["reprojection_rmse_px"] == pytest.approx(expected)
-    assert result["summary"]["translation_rms_mm"] < 1e-8
+def test_rotation_mean_handles_angle_wrap(scene):
+    calibrator, points, _ = scene
+    calibrator.cam2end = np.eye(4)
+    samples = [dict(image_index=i, end_to_base=np.eye(4),
+                    board_to_camera=pose([0, 0, np.radians(angle)], [0, 0, 1]))
+               for i, angle in enumerate([179, 180, -179])]
+    result = evaluate((calibrator, points, samples))
+    assert result["status"] == "ok"
+    assert result["summary"]["rotation_max_deg"] == pytest.approx(1)
+    np.testing.assert_allclose(result["board_to_base_reference"][:3, :3],
+                               np.diag([-1, -1, 1]), atol=1e-12)
 
 
-@pytest.mark.parametrize("failure", ["few_frames", "nan", "nonrigid", "negative_depth"])
+@pytest.mark.parametrize("failure", ["few_frames", "nan", "nonrigid", "invalid_sample"])
 def test_evaluation_failure_has_no_precision_numbers(scene, failure):
     calibrator, points, samples = scene
     assert evaluate(scene)["status"] == "ok"  # Failure must clear a previous success.
@@ -149,10 +152,7 @@ def test_evaluation_failure_has_no_precision_numbers(scene, failure):
     elif failure == "nonrigid":
         calibrator.cam2end[0, 0] = 2
     else:
-        calibrator.cam2end = np.eye(4)
-        for sample in samples:
-            sample["end_to_base"] = np.eye(4)
-            sample["board_to_camera"] = pose([0, 0, 0], [0, 0, -1])
+        samples[0]["board_to_camera"][3, 0] = 1
     result = evaluate((calibrator, points, samples))
     assert result["status"] == "failed"
     assert "summary" not in result and "per_frame" not in result
@@ -166,7 +166,7 @@ def mock_detection(module, scene, monkeypatch, missing=(), pnp_failed=(), pnp_ra
     calibrator, _, samples = scene
     calibrator.images = [np.full((8, 8, 3), i, dtype=np.uint8) for i in range(len(samples))]
     calibrator.end_pose_matrixes = [s["end_to_base"] for s in samples]
-    def detect(gray, *args):
+    def detect(gray, *args, **kwargs):
         i = int(gray[0, 0])
         return (False, None) if i in missing else (True, samples[i]["image_points"].copy())
     monkeypatch.setattr(module.cv2, "findChessboardCornersSB", detect)
@@ -192,7 +192,7 @@ def test_calibration_skips_pairs_and_writes_outputs(module, scene, monkeypatch, 
     assert result["status"] == "ok"
     assert result["valid_frames"] == len(samples) - 3
     assert [r["image_index"] for r in result["per_frame"]] == [0, 2, 4, 6, 7, 8, 9, 10, 11]
-    assert result["summary"]["reprojection_rmse_px"] < 1e-4
+    assert max(result["summary"].values()) < 1e-4
     assert Path(calibrator.save_path, "hand_eye_error_analysis.jpg").stat().st_size > 0
     calibrator.report_calibration()
     report = Path(calibrator.save_path, "Calibration_Report.txt").read_text()
@@ -200,6 +200,14 @@ def test_calibration_skips_pairs_and_writes_outputs(module, scene, monkeypatch, 
     assert "Valid frames: 9" in report
     assert "Rotation RMS (degrees)" in report
     assert "--Extrinsic--" in report
+    assert "reprojection" not in calibrator.format_hand_eye_report().lower()
+    saved = json.loads(Path(calibrator.save_path, "hand_eye_consistency.json").read_text())
+    assert saved["transform"] == "board_to_base"
+    assert saved["translation_unit"] == "m"
+    np.testing.assert_allclose(saved["board_to_base_reference"], result["board_to_base_reference"])
+    assert [row["image_index"] for row in saved["per_frame"]] == [0, 2, 4, 6, 7, 8, 9, 10, 11]
+    for actual_row, expected_row in zip(saved["per_frame"], result["per_frame"]):
+        np.testing.assert_allclose(actual_row["board_to_base"], expected_row["board_to_base"])
     assert "--Hand-eye Evaluation--" in capsys.readouterr().out
     module.AIRBOTPlay.assert_not_called()
 
@@ -272,7 +280,7 @@ def test_intrinsic_error_accepts_corner_layouts(module, scene, monkeypatch,
     calibrator.images = [np.zeros((480, 640, 3), dtype=np.uint8)]
     projected = np.arange(160, dtype=np.float64).reshape(80, 2)
     observed = (projected + [3, 4]).astype(np.float32).reshape(observed_shape)
-    monkeypatch.setattr(module.cv2, "findChessboardCornersSB", lambda *args: (True, observed))
+    monkeypatch.setattr(module.cv2, "findChessboardCornersSB", lambda *args, **kwargs: (True, observed))
     for name in ["drawChessboardCorners", "imshow", "waitKey", "destroyAllWindows"]:
         monkeypatch.setattr(module.cv2, name, lambda *args: None)
     monkeypatch.setattr(module.cv2, "calibrateCamera", lambda *args:
@@ -328,7 +336,7 @@ def test_manual_rejection_shared_by_intrinsic_and_hand_eye(module, scene, monkey
         assert wait_key.call_count == len(samples)
         assert [r["image_index"] for r in calibrator.hand_eye_errors["per_frame"]] == [
             s["image_index"] for s in accepted]
-        assert calibrator.hand_eye_errors["summary"]["reprojection_rmse_px"] < 1e-4
+        assert max(calibrator.hand_eye_errors["summary"].values()) < 1e-4
         assert len(calibrator.images) == len(samples)
         np.testing.assert_array_equal(calibrator.end_pose_matrixes, original_poses)
     finally:
