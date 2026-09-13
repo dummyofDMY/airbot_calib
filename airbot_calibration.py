@@ -27,7 +27,7 @@ parser.add_argument(
     "-o", "--output-path", type=str, default="calib/", help="Directory to save the generated calibration data.",
 )
 parser.add_argument(
-    "-p", "--port", type=int, default=50051, help="Robot port number.",
+    "-p", "--port", type=int, default=50010, help="Robot server port number (default: 50010; must match airbot_server -p).",
 )
 parser.add_argument(
     "--ros-topic", type=str, default="/camera/image_raw", help="ROS image topic (valid when using ros cam)"
@@ -142,7 +142,7 @@ if args.camera_type == "ros" and not args.input_dir:
 
 class ChessBoard:
     def __init__(self):
-        self.rows = 10
+        self.rows = 11
         self.cols = 8
         self.square_size = 0.02 # m
         self.number_of_image_needed = 30
@@ -172,7 +172,8 @@ class AirbotCalibration:
             self.load_data(args.input_dir)
         elif args.camera_type == "realsense":
             try:
-                self.camera = RealsenseCamera()
+                # Calibration uses image corners only; do not wait on depth frames.
+                self.camera = RealsenseCamera(color_only=True)
             except ImportError as e:
                 print(f"Error importing RealsenseCamera: {e}")
                 print("Please make sure airbot_realsense module is installed.")
@@ -745,6 +746,7 @@ def draw_frame(T, ax=None, name='frame'):
     return ax
 
 if __name__ == "__main__":
+    calibrator = None
     try:
         calibrator = AirbotCalibration()
         print(f"\n{'='*60}")
@@ -776,13 +778,23 @@ if __name__ == "__main__":
         else:
             print("\nCalibration process completed successfully.")
 
+        if calibrator.cam2end is not None:
+            ax = draw_frame(np.eye(4), name='eef')
+            draw_frame(calibrator.cam2end, ax=ax, name='cam')
+            ax.view_init(elev=20, azim=70)
+            frame_plot_path = os.path.join(calibrator.save_path, "ee_camera_frames.png")
+            ax.figure.savefig(frame_plot_path, dpi=300, bbox_inches="tight")
+            print(f"EE/camera coordinate frame plot saved to: {frame_plot_path}")
+            if args.no_display_mode:
+                plt.close(ax.figure)
         if not args.no_display_mode:
-            if calibrator.cam2end is not None:
-                ax = draw_frame(np.eye(4), name='eef')
-                draw_frame(calibrator.cam2end, ax=ax, name='cam')
-                ax.view_init(elev=20, azim=70)
             plt.show()
                 
     except Exception as e:
         print(f"\nError during calibration: {e}")
         sys.exit(1)
+    finally:
+        if calibrator is not None and not args.input_dir:
+            if hasattr(calibrator.camera, "deinit"):
+                calibrator.camera.deinit()
+        cv2.destroyAllWindows()

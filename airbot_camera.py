@@ -7,7 +7,8 @@ import cv2
 class RealsenseCamera:
     __unaligned_warning_printed = False
 
-    def __init__(self) -> None:
+    def __init__(self, color_only: bool = False) -> None:
+        self.color_only = color_only
         with open("configs/config_file.yaml", "r") as file:
             config_path = yaml.safe_load(file)["Path"]
         config = yaml.safe_load(open(config_path, "r"))
@@ -25,13 +26,14 @@ class RealsenseCamera:
         # Configure streams
         self.pipeline = rs.pipeline()
         rs_config = rs.config()
-        rs_config.enable_stream(
-            rs.stream.depth,
-            self.profile[0],
-            self.profile[1],
-            rs.format.z16,
-            self.profile[2],
-        )
+        if not self.color_only:
+            rs_config.enable_stream(
+                rs.stream.depth,
+                self.profile[0],
+                self.profile[1],
+                rs.format.z16,
+                self.profile[2],
+            )
         rs_config.enable_stream(
             rs.stream.color,
             self.profile[0],
@@ -42,10 +44,10 @@ class RealsenseCamera:
         # Start streaming
         cfg = self.pipeline.start(rs_config)
         color_profile = cfg.get_stream(rs.stream.color)
-        depth_profile = cfg.get_stream(rs.stream.depth)
-        print(
-            f"color profile:{color_profile.as_video_stream_profile()}\ndepth profile:{depth_profile.as_video_stream_profile()}"
-        )
+        print(f"color profile:{color_profile.as_video_stream_profile()}")
+        if not self.color_only:
+            depth_profile = cfg.get_stream(rs.stream.depth)
+            print(f"depth profile:{depth_profile.as_video_stream_profile()}")
         
         # Set processers
         self.aligner = rs.align(rs.stream.color)
@@ -75,8 +77,9 @@ class RealsenseCamera:
         return self.distortion
 
     def deinit(self) -> bool:
-        self.inited = False
-        self.pipeline.stop()
+        if self.inited:
+            self.pipeline.stop()
+            self.inited = False
         return True
 
     def get_rgb(self) -> np.ndarray:
@@ -92,6 +95,18 @@ class RealsenseCamera:
         return self.get_frame("depth_map")
 
     def get_frame(self, frame_type: str | list[str] = ["bgr","depth"], align: bool = True):
+        if self.color_only:
+            requested = frame_type if isinstance(frame_type, list) else [frame_type]
+            if any(kind not in ("bgr", "rgb") for kind in requested):
+                raise ValueError("Color-only mode supports only 'bgr' and 'rgb' frames")
+            frames = self.pipeline.wait_for_frames(10000)
+            color_frame = frames.get_color_frame()
+            if not color_frame:
+                raise RuntimeError("RealSense returned no color frame")
+            bgr_image = np.array(color_frame.get_data())
+            result = [bgr_image if kind == "bgr" else cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+                      for kind in requested]
+            return result if isinstance(frame_type, list) else result[0]
         frames = self.pipeline.wait_for_frames()
         if align:
             frames = self.aligner.process(frames)

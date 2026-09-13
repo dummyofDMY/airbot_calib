@@ -1,4 +1,5 @@
 ## Dependencies Installation
+
 ```bash
 # Install airbot configuration package (skip this step on Pro version)
 sudo apt install ./airbot-configure_5.1.6-1_all.deb
@@ -17,13 +18,17 @@ pip install ./airbot_py-5.1.6-py3-none-any.whl
 # Proxy might be required in command line or you can manually download and install the source code
 pip install -r requirements.txt -i https://mirrors.huaweicloud.com/repository/pypi/simple
 ```
+
 ### Hand-Eye Calibration
+
 **Note:** Default calibration resolution is 480p. Modify `configs/sam_simplegrasp.yaml` to change settings.
 
 #### Run arm server
+
 ```bash
 airbot_server -i can0 -p 50010
 ```
+
 #### Run calib
 
 The calibration board is a 9×11, 20mm black and white chessboard pattern calibration board.
@@ -31,6 +36,7 @@ The calibration board is a 9×11, 20mm black and white chessboard pattern calibr
 ```bash
 python3 airbot_calibration.py  # Use -h flag for help options
 ```
+
 Drag arm to change robot pose, make sure that the chessboard in the camera view, Press `ESC` to capture img and pose.
 
 To recalibrate from saved data without connecting the camera or robot:
@@ -73,9 +79,7 @@ You can use the following reference parameters under the conditions mentioned be
 
 Calibration Setup: The arm and the calibration board are placed on a white table at a height of 74.5 cm, and both are on the same plane.
 
-
-
-![image-20250718163325802](/home/peng/snap/typora/96/.config/Typora/typora-user-images/image-20250718163325802.png)
+![image-20250718163325802](</home/peng/snap/typora/96/.config/Typora/typora-user-images/image-20250718163325802.png>)
 
 ```
 480p:
@@ -93,9 +97,8 @@ Calibration Setup: The arm and the calibration board are placed on a white table
       - [ 0.        ,  0.        ,  0.        ,  1.        ]
 ```
 
-
-
 #### Run grasp app
+
 ```bash
 source venv/bin/activate
 python3 airbot_interface.py
@@ -111,7 +114,7 @@ Basic Usage:
 
 Click "Capture" to take a snapshot of the scene. Then click on the object in the image at the lower-left corner, and click "Pick and Place" to automatically recognize and perform the grasping action.
 
-![image-20250718163630327](/home/peng/snap/typora/96/.config/Typora/typora-user-images/image-20250718163630327.png)
+![image-20250718163630327](</home/peng/snap/typora/96/.config/Typora/typora-user-images/image-20250718163630327.png>)
 
 The basic graspable area is shown in the figure below, covering approximately 80% of the workspace.
 
@@ -120,4 +123,4 @@ The basic graspable area is shown in the figure below, covering approximately 80
 #### Debug
 
 1. If the observe pose and place pose need to be changed, you can enter gravity compensaton mode, drag arm to the property pose, and copy the pose, Modify them in the `config/sam_simplegrasp.yaml`
-![image-20250718164005357](/home/peng/snap/typora/96/.config/Typora/typora-user-images/image-20250718164005357.png)
+   ![image-20250718164005357](</home/peng/snap/typora/96/.config/Typora/typora-user-images/image-20250718164005357.png>)
